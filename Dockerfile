@@ -12,6 +12,7 @@ RUN \
         curl \
         gnupg \
         git \
+        ssh \
     && \
     apt-get clean && \
     apt-get autoremove && \
