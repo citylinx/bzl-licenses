@@ -24,6 +24,10 @@ const columnify = require('columnify');
 const { stringify: csvStringify } = require('csv-stringify/sync');
 const { DateTime } = require('luxon');
 
+const FIRST_PARTY_REPOSITORY = /github\.com[:/](beezeelinx|citylinx)\//i;
+const FIRST_PARTY_SHORTHAND = /^github:(beezeelinx|citylinx)\//i;
+const DEPENDENCY_FIELDS = ['dependencies', 'devDependencies', 'optionalDependencies'];
+
 exports.command = 'npm <command>';
 exports.description = 'Handle npm modules licenses';
 
@@ -353,6 +357,123 @@ async function isOlderThan1Week(packageInfo) {
 }
 
 /**
+ * Test whether a dependency specifier or a resolved URL points at a first party repository
+ *
+ * @param {string} [spec]
+ */
+function isFirstParty(spec) {
+    return !!spec && (FIRST_PARTY_REPOSITORY.test(spec) || FIRST_PARTY_SHORTHAND.test(spec));
+}
+
+/**
+ * Remove the first party dependencies from the copied package.json and package-lock.json, so that
+ * `npm ci` never has to authenticate against the private BeeZeeLinx/CityLinx repositories.
+ *
+ * Those packages are already excluded from the report (see getLicensesInfo) and only the direct
+ * dependencies are reported, so nothing that would be printed is lost.
+ *
+ * @param {string} dir Directory holding the copy of the module
+ * @return {Promise<string[]>} Names of the removed dependencies
+ */
+async function removeFirstPartyDependencies(dir) {
+    const packageJsonPath = Path.resolve(dir, 'package.json');
+    const lockPath = Path.resolve(dir, 'package-lock.json');
+
+    const packageJson = await Fs.readJson(packageJsonPath, { encoding: 'utf8' });
+    const lock = (await Fs.pathExists(lockPath)) ? await Fs.readJson(lockPath, { encoding: 'utf8' }) : undefined;
+
+    /** @type {Set<string>} */
+    const removed = new Set();
+
+    // Remove a dependency from the entry holding it: the root package for a top level dependency,
+    // the parent package for a nested one. Leaving the reference behind makes `npm ci` reject the
+    // lock file.
+
+    const removeReference = (holder, name) => {
+        DEPENDENCY_FIELDS.forEach(field => {
+            if (holder && holder[field]) {
+                delete holder[field][name];
+            }
+        });
+    };
+
+    if (lock && lock.packages) {
+
+        // lockfileVersion 2 and 3: a flat map of "node_modules/..." entries
+
+        const firstPartyEntries = Object.keys(lock.packages)
+            .filter(entry => entry && isFirstParty(lock.packages[entry].resolved));
+
+        firstPartyEntries.forEach(entry => {
+            const nested = entry.lastIndexOf('/node_modules/');
+            const name = entry.slice(entry.lastIndexOf('node_modules/') + 'node_modules/'.length);
+
+            removeReference(nested === -1 ? lock.packages[''] : lock.packages[entry.slice(0, nested)], name);
+
+            if (nested === -1) {
+                removeReference(packageJson, name);
+            }
+
+            removed.add(name);
+        });
+
+        // Drop the entries themselves, together with anything nested underneath them: those are
+        // only reachable through a package that is being removed
+
+        Object.keys(lock.packages)
+            .filter(entry => firstPartyEntries.some(first => entry === first || entry.startsWith(`${first}/`)))
+            .forEach(entry => delete lock.packages[entry]);
+    }
+
+    if (lock && lock.dependencies) {
+
+        // lockfileVersion 1 and 2: a parallel tree where a git dependency carries its URL as version
+
+        const pruneLegacy = (dependencies) => {
+            Object.keys(dependencies).forEach(name => {
+                const info = dependencies[name];
+
+                if (isFirstParty(info.resolved) || isFirstParty(info.version)) {
+                    delete dependencies[name];
+                    removeReference(packageJson, name);
+                    removed.add(name);
+                    return;
+                }
+
+                if (info.dependencies) {
+                    pruneLegacy(info.dependencies);
+                }
+            });
+        };
+
+        pruneLegacy(lock.dependencies);
+    }
+
+    // Dependencies declared with a first party specifier but absent from the lock file
+
+    DEPENDENCY_FIELDS.forEach(field => {
+        Object.entries(packageJson[field] || {})
+            .filter(([_name, spec]) => isFirstParty(/** @type string */(spec)))
+            .forEach(([name]) => {
+                delete packageJson[field][name];
+                removed.add(name);
+            });
+    });
+
+    if (removed.size === 0) {
+        return [];
+    }
+
+    await Fs.writeJson(packageJsonPath, packageJson, { spaces: 2 });
+
+    if (lock) {
+        await Fs.writeJson(lockPath, lock, { spaces: 2 });
+    }
+
+    return [...removed].sort();
+}
+
+/**
  *
  *
  * @param {string} modulePath
@@ -377,6 +498,12 @@ async function getLicensesInfo(modulePath) {
                 return true;
             }
         });
+
+        const removed = await removeFirstPartyDependencies(o.path);
+
+        if (removed.length > 0) {
+            Console.log(clc.italic(`Skipping ${removed.length} first party dependencies: ${removed.join(', ')}`));
+        }
 
         Console.log(clc.italic(`Installing package dependencies...`));
 
