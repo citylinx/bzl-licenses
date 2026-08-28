@@ -402,7 +402,6 @@ async function getLicensesInfo(modulePath) {
             stdout = /** @type {any} */ (error).stdout || '';
             downloadError = error;
         }
-
         /** @type { {Path: string; Version: string; Dir?: string; Error?: string;}[] } */
         const downloads = JSON.parse(`[${stdout.replace(/}(\r\n|\r|\n){/g, '},{')}]`);
 
@@ -429,7 +428,13 @@ async function getLicensesInfo(modulePath) {
         const licensesInfo = JSON.parse(detected);
 
         licensesInfo.forEach(licenseInfo => {
-            licenseInfo.project = modulePaths.get(licenseInfo.project) || licenseInfo.project;
+            const modulePath = modulePaths.get(licenseInfo.project);
+
+            if (!modulePath) {
+                throw new Error(`license-detector reported an unknown project "${licenseInfo.project}"`);
+            }
+
+            licenseInfo.project = modulePath;
         });
 
         return licensesInfo;
