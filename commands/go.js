@@ -480,6 +480,19 @@ async function getLicensesInfo(modulePath) {
 }
 
 /**
+ * Test whether a `replace` directive applies to a required module: a directive without a version on
+ * its left hand side replaces every version of the module, one with a version only that version.
+ *
+ * @param { {Old: {Path: string; Version?: string;};} } replacement
+ * @param { {Path: string; Version: string;} } required
+ * @return {boolean}
+ */
+function replaces(replacement, required) {
+    return replacement.Old.Path === required.Path
+        && (!replacement.Old.Version || replacement.Old.Version === required.Version);
+}
+
+/**
  * Read the direct dependencies of a module from its go.mod.
  *
  * `go mod edit -json` is purely local: unlike `go list -m all` it does not load the module graph,
@@ -492,15 +505,21 @@ async function getModuleDependencies(modulePath) {
 
     const { stdout } = await exec('go mod edit -json', { cwd: modulePath, maxBuffer: MAX_BUFFER });
 
-    /** @type { {Module: {Path: string;}; Require?: {Path: string; Version: string; Indirect?: boolean;}[]; Replace?: {Old: {Path: string;}; New: {Path: string; Version?: string;};}[]; } } */
+    /** @type { {Module: {Path: string;}; Require?: {Path: string; Version: string; Indirect?: boolean;}[]; Replace?: {Old: {Path: string; Version?: string;}; New: {Path: string; Version?: string;};}[]; } } */
     const goMod = JSON.parse(stdout);
 
     const replacements = goMod.Replace || [];
+    const directRequires = (goMod.Require || []).filter(required => !required.Indirect);
+
+    // Only the replacements actually applying to a direct dependency are of interest: a directive
+    // left over for a module that is not required is a no op for the build, and so for the report
+
+    const applied = replacements.filter(replacement => directRequires.some(required => replaces(replacement, required)));
 
     // Handle the replacements pointing at a directory inside the module being checked: a
     // replacement without a version is a filesystem path, relative to the go.mod holding it
 
-    const replace$ = replacements
+    const replace$ = applied
         .filter(replacement => !replacement.New.Version)
         .map(replacement => Path.resolve(modulePath, replacement.New.Path))
         .filter(dir => dir.startsWith(modulePath))
@@ -508,21 +527,36 @@ async function getModuleDependencies(modulePath) {
 
     const replace = await Promise.all(replace$);
 
-    // Keep only direct dependencies. A replaced one is skipped: its license is the license of the
-    // replacement, which is either first party or reported through the replacement module itself
+    // A replaced dependency is reported through its replacement, which is the code that actually
+    // ships. A replacement with a version is a module of its own: it has to be downloaded and
+    // scanned like any other dependency. One without a version is source, either part of the module
+    // and covered by the recursion above, or out of reach
 
-    const replaced = new Set(replacements.map(replacement => replacement.Old.Path));
+    /** @type { {Path: string; Version: string;}[] } */
+    const replacementDeps = applied
+        .filter(replacement => !!replacement.New.Version)
+        .map(replacement => ({ Path: replacement.New.Path, Version: /** @type {string} */(replacement.New.Version) }));
+
+    applied
+        .filter(replacement => !replacement.New.Version)
+        .map(replacement => Path.resolve(modulePath, replacement.New.Path))
+        .filter(dir => !dir.startsWith(modulePath))
+        .forEach(dir => console.error(clc.yellow(`"${dir}" replaces a dependency of ${goMod.Module.Path} but is outside the module: its license cannot be checked`)));
+
+    // Keep only the direct dependencies that are not replaced
 
     /** @type { {Main?: boolean; Path: string; Version: string;}[] } */
-    let moduleDeps = (goMod.Require || [])
-        .filter(required => !required.Indirect && !replaced.has(required.Path))
+    let moduleDeps = directRequires
+        .filter(required => !replacements.some(replacement => replaces(replacement, required)))
         .map(required => ({ Path: required.Path, Version: required.Version }));
 
-    // Merge replace dependencies
+    // Merge replace dependencies. The replacements come first: `uniqBy` keeps the first occurrence
+    // and a replacement version wins over a plain `require` of the same module
 
     moduleDeps = _.uniqBy(
         [
             { Path: goMod.Module.Path, Version: '', Main: true },
+            ...replacementDeps,
             ...moduleDeps,
             ..._.flattenDeep(replace).filter(rep => !rep.Main)
         ],
