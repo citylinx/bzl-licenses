@@ -366,6 +366,41 @@ function isFirstParty(spec) {
 }
 
 /**
+ * Resolve the lock entry a dependency edge points at, following the `node_modules` lookup rules:
+ * from the entry holding the edge, walk up until a matching entry is found.
+ *
+ * @param {Record<string, any>} packages `packages` map of the lock file
+ * @param {string} holder Key of the entry holding the edge, '' for the root package
+ * @param {string} name Name of the dependency
+ * @return {string | undefined} Key of the entry the edge resolves to, undefined when unresolved
+ */
+function resolveEntry(packages, holder, name) {
+    let prefix = holder;
+
+    for (; ;) {
+        const candidate = prefix ? `${prefix}/node_modules/${name}` : `node_modules/${name}`;
+
+        if (packages[candidate]) {
+            return candidate;
+        }
+
+        if (!prefix) {
+            return undefined;
+        }
+
+        const nested = prefix.lastIndexOf('/node_modules/');
+
+        if (nested !== -1) {
+            prefix = prefix.slice(0, nested);
+        } else if (prefix.includes('/')) {
+            prefix = prefix.slice(0, prefix.lastIndexOf('/'));
+        } else {
+            prefix = '';
+        }
+    }
+}
+
+/**
  * Remove the first party dependencies from the copied package.json and package-lock.json, so that
  * `npm ci` never has to authenticate against the private BeeZeeLinx/CityLinx repositories.
  *
@@ -385,9 +420,9 @@ async function removeFirstPartyDependencies(dir) {
     /** @type {Set<string>} */
     const removed = new Set();
 
-    // Remove a dependency from the entry holding it: the root package for a top level dependency,
-    // the parent package for a nested one. Leaving the reference behind makes `npm ci` reject the
-    // lock file.
+    // Remove a dependency from a package.json or from a lock entry. Leaving the reference behind
+    // makes `npm ci` reject the lock file, or resolve the dependency on its own and clone the
+    // private repository.
 
     const removeReference = (holder, name) => {
         DEPENDENCY_FIELDS.forEach(field => {
@@ -397,74 +432,138 @@ async function removeFirstPartyDependencies(dir) {
         });
     };
 
+    // A package.json and the lock entry mirroring it have to lose an edge together, or `npm ci`
+    // reports them out of sync: pair them up, the root package.json with the '' entry and the
+    // package.json of a workspace with the entry of its directory
+
+    /** @type { {path: string; json: any; entry: string;}[] } */
+    const manifests = [{ path: packageJsonPath, json: packageJson, entry: '' }];
+
     if (lock && lock.packages) {
 
-        // lockfileVersion 2 and 3: a flat map of "node_modules/..." entries
+        // Any key without a "node_modules/" segment is a workspace directory
+
+        const workspaces = Object.keys(lock.packages).filter(entry => entry && !entry.includes('node_modules/'));
+
+        for (const workspace of workspaces) {
+            const manifestPath = Path.resolve(dir, workspace, 'package.json');
+
+            if (await Fs.pathExists(manifestPath)) {
+                manifests.push({
+                    path: manifestPath,
+                    json: await Fs.readJson(manifestPath, { encoding: 'utf8' }),
+                    entry: workspace
+                });
+            }
+        }
+    }
+
+    if (lock && lock.packages) {
+
+        // lockfileVersion 2 and 3: a flat map of "node_modules/..." entries. A workspace directory
+        // is local source rather than something npm fetches, so it is never first party
 
         const firstPartyEntries = Object.keys(lock.packages)
-            .filter(entry => entry && isFirstParty(lock.packages[entry].resolved));
+            .filter(entry => entry.includes('node_modules/') && isFirstParty(lock.packages[entry].resolved));
 
-        firstPartyEntries.forEach(entry => {
-            const nested = entry.lastIndexOf('/node_modules/');
-            const name = entry.slice(entry.lastIndexOf('node_modules/') + 'node_modules/'.length);
+        // Anything nested under a first party entry is only reachable through it
 
-            removeReference(nested === -1 ? lock.packages[''] : lock.packages[entry.slice(0, nested)], name);
+        const deleted = new Set(Object.keys(lock.packages)
+            .filter(entry => firstPartyEntries.some(first => entry === first || entry.startsWith(`${first}/`))));
 
-            if (nested === -1) {
-                removeReference(packageJson, name);
-            }
-
-            removed.add(name);
-        });
-
-        // Drop the entries themselves, together with anything nested underneath them: those are
-        // only reachable through a package that is being removed
+        // Drop every edge resolving to a deleted entry, wherever it is declared: the root package, a
+        // workspace or another package. An edge resolves against the entry holding it, so a name
+        // deleted at one level never takes away a homonym resolved at another
 
         Object.keys(lock.packages)
-            .filter(entry => firstPartyEntries.some(first => entry === first || entry.startsWith(`${first}/`)))
-            .forEach(entry => delete lock.packages[entry]);
+            .filter(entry => !deleted.has(entry))
+            .forEach(entry => {
+                const manifest = manifests.find(candidate => candidate.entry === entry);
+
+                DEPENDENCY_FIELDS.forEach(field => {
+                    Object.keys(lock.packages[entry][field] || {})
+                        .filter(name => {
+                            const resolved = resolveEntry(lock.packages, entry, name);
+
+                            return !!resolved && deleted.has(resolved);
+                        })
+                        .forEach(name => {
+                            delete lock.packages[entry][field][name];
+
+                            if (manifest) {
+                                removeReference(manifest.json, name);
+                            }
+                        });
+                });
+            });
+
+        deleted.forEach(entry => delete lock.packages[entry]);
+
+        firstPartyEntries.forEach(entry => removed.add(entry.slice(entry.lastIndexOf('node_modules/') + 'node_modules/'.length)));
     }
 
     if (lock && lock.dependencies) {
 
-        // lockfileVersion 1 and 2: a parallel tree where a git dependency carries its URL as version
+        // lockfileVersion 1 and 2: a parallel tree where a git dependency carries its URL as
+        // version. npm reads `packages` whenever it is present, so this tree describes the tree to
+        // install only when it is the sole representation
 
-        const pruneLegacy = (dependencies) => {
+        const authoritative = !lock.packages;
+
+        /**
+         * @param {Record<string, any>} dependencies
+         * @param {boolean} top
+         */
+        const pruneLegacy = (dependencies, top) => {
             Object.keys(dependencies).forEach(name => {
                 const info = dependencies[name];
 
                 if (isFirstParty(info.resolved) || isFirstParty(info.version)) {
                     delete dependencies[name];
-                    removeReference(packageJson, name);
                     removed.add(name);
+
+                    // Only a top level entry is the one the root package.json refers to: a nested
+                    // entry is another package that happens to share its name
+
+                    if (top && authoritative) {
+                        removeReference(packageJson, name);
+                    }
                     return;
                 }
 
                 if (info.dependencies) {
-                    pruneLegacy(info.dependencies);
+                    pruneLegacy(info.dependencies, false);
                 }
             });
         };
 
-        pruneLegacy(lock.dependencies);
+        pruneLegacy(lock.dependencies, true);
     }
 
-    // Dependencies declared with a first party specifier but absent from the lock file
+    // Dependencies declared with a first party specifier but absent from the lock file: the entry
+    // mirroring the manifest has to lose the edge as well
 
-    DEPENDENCY_FIELDS.forEach(field => {
-        Object.entries(packageJson[field] || {})
-            .filter(([_name, spec]) => isFirstParty(/** @type string */(spec)))
-            .forEach(([name]) => {
-                delete packageJson[field][name];
-                removed.add(name);
-            });
+    manifests.forEach(manifest => {
+        const entry = lock && lock.packages ? lock.packages[manifest.entry] : undefined;
+
+        DEPENDENCY_FIELDS.forEach(field => {
+            Object.entries(manifest.json[field] || {})
+                .filter(([_name, spec]) => isFirstParty(/** @type string */(spec)))
+                .forEach(([name]) => {
+                    delete manifest.json[field][name];
+                    removeReference(entry, name);
+                    removed.add(name);
+                });
+        });
     });
 
     if (removed.size === 0) {
         return [];
     }
 
-    await Fs.writeJson(packageJsonPath, packageJson, { spaces: 2 });
+    for (const manifest of manifests) {
+        await Fs.writeJson(manifest.path, manifest.json, { spaces: 2 });
+    }
 
     if (lock) {
         await Fs.writeJson(lockPath, lock, { spaces: 2 });
