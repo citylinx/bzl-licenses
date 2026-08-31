@@ -445,7 +445,7 @@ async function removeFirstPartyDependencies(dir) {
 
         const workspaces = Object.keys(lock.packages).filter(entry => entry && !entry.includes('node_modules/'));
         console.log('------workspaces------');
-        console.log(workspaces);
+        console.log(JSON.stringify(workspaces));
         for (const workspace of workspaces) {
             const manifestPath = Path.resolve(dir, workspace, 'package.json');
 
