@@ -24,6 +24,10 @@ const columnify = require('columnify');
 const { stringify: csvStringify } = require('csv-stringify/sync');
 const { DateTime } = require('luxon');
 
+const BEEZEELINX_PRIVATE_REPOSITORY = /github\.com[:/](beezeelinx|citylinx)\//i;
+const BEEZEELINX_PRIVATE_REPOSITORY_SHORTHAND = /^github:(beezeelinx|citylinx)\//i;
+const DEPENDENCY_FIELDS = ['dependencies', 'devDependencies', 'optionalDependencies'];
+
 exports.command = 'npm <command>';
 exports.description = 'Handle npm modules licenses';
 
@@ -353,6 +357,220 @@ async function isOlderThan1Week(packageInfo) {
 }
 
 /**
+ * Test whether a dependency specifier or a resolved URL points at a first party repository
+ *
+ * @param {string} [spec]
+ */
+function isBeezeelinxPrivateRepo(spec) {
+    return !!spec && (BEEZEELINX_PRIVATE_REPOSITORY.test(spec) || BEEZEELINX_PRIVATE_REPOSITORY_SHORTHAND.test(spec));
+}
+
+/**
+ * Resolve the lock entry a dependency edge points at, following the `node_modules` lookup rules:
+ * from the entry holding the edge, walk up until a matching entry is found.
+ *
+ * @param {Record<string, any>} packages `packages` map of the lock file
+ * @param {string} holder Key of the entry holding the edge, '' for the root package
+ * @param {string} name Name of the dependency
+ * @return {string | undefined} Key of the entry the edge resolves to, undefined when unresolved
+ */
+function resolveEntry(packages, holder, name) {
+    let prefix = holder;
+
+    for (; ;) {
+        const candidate = prefix ? `${prefix}/node_modules/${name}` : `node_modules/${name}`;
+
+        if (packages[candidate]) {
+            return candidate;
+        }
+
+        if (!prefix) {
+            return undefined;
+        }
+
+        const nested = prefix.lastIndexOf('/node_modules/');
+
+        if (nested !== -1) {
+            prefix = prefix.slice(0, nested);
+        } else if (prefix.includes('/')) {
+            prefix = prefix.slice(0, prefix.lastIndexOf('/'));
+        } else {
+            prefix = '';
+        }
+    }
+}
+
+/**
+ * Remove the first party dependencies from the copied package.json and package-lock.json, so that
+ * `npm ci` never has to authenticate against the private BeeZeeLinx/CityLinx repositories.
+ *
+ * Those packages are already excluded from the report (see getLicensesInfo) and only the direct
+ * dependencies are reported, so nothing that would be printed is lost.
+ *
+ * @param {string} dir Directory holding the copy of the module
+ * @return {Promise<string[]>} Names of the removed dependencies
+ */
+async function removeFirstPartyDependencies(dir) {
+    const packageJsonPath = Path.resolve(dir, 'package.json');
+    const lockPath = Path.resolve(dir, 'package-lock.json');
+
+    const packageJson = await Fs.readJson(packageJsonPath, { encoding: 'utf8' });
+    const lock = (await Fs.pathExists(lockPath)) ? await Fs.readJson(lockPath, { encoding: 'utf8' }) : undefined;
+
+    // lockfileVersion 1 has no `packages` map, so its legacy tree is the only representation and
+    // the one npm installs from. Reject it rather than pruning it: regenerating the lock with
+    // npm 9 or later produces a supported format
+
+    if (lock && !lock.packages) {
+        throw new Error(`Unsupported lock file ${lockPath}: lockfileVersion ${lock.lockfileVersion} has no "packages" map, regenerate it with npm 9 or later`);
+    }
+
+    /** @type {Set<string>} */
+    const removed = new Set();
+
+    // Remove a dependency from a package.json or from a lock entry. Leaving the reference behind
+    // makes `npm ci` reject the lock file, or resolve the dependency on its own and clone the
+    // private repository.
+
+    const removeReference = (holder, name) => {
+        DEPENDENCY_FIELDS.forEach(field => {
+            if (holder && holder[field]) {
+                delete holder[field][name];
+            }
+        });
+    };
+
+    // A package.json and the lock entry mirroring it have to lose an edge together, or `npm ci`
+    // reports them out of sync: pair them up, the root package.json with the '' entry and the
+    // package.json of a workspace with the entry of its directory
+
+    /** @type { {path: string; json: any; entry: string;}[] } */
+    const manifests = [{ path: packageJsonPath, json: packageJson, entry: '' }];
+
+    if (lock && lock.packages) {
+
+        // Any key without a "node_modules/" segment is a workspace directory
+
+        const workspaces = Object.keys(lock.packages).filter(entry => entry && !entry.includes('node_modules/'));
+        for (const workspace of workspaces) {
+            const manifestPath = Path.resolve(dir, workspace, 'package.json');
+
+            if (await Fs.pathExists(manifestPath)) {
+                manifests.push({
+                    path: manifestPath,
+                    json: await Fs.readJson(manifestPath, { encoding: 'utf8' }),
+                    entry: workspace
+                });
+            }
+        }
+    }
+
+    if (lock && lock.packages) {
+
+        // lockfileVersion 2 and 3: a flat map of "node_modules/..." entries. A workspace directory
+        // is local source rather than something npm fetches, so it is never first party
+
+        //Nomenclature:
+        // packageDir   -> ex: node_modules/cli-color
+        // packageName  -> ex: cli-color
+
+        const beezeelinxReposDirs = Object.keys(lock.packages)
+            .filter(packageDir => packageDir.includes('node_modules/') && isBeezeelinxPrivateRepo(lock.packages[packageDir].resolved));
+
+        // Anything nested under a beezeelinxRepos is only reachable through it and should be deleted
+
+        const deletedDirs = new Set(Object.keys(lock.packages)
+            .filter(packageDir => beezeelinxReposDirs.some(beezeelinxRepo => packageDir === beezeelinxRepo || packageDir.startsWith(`${beezeelinxReposDirs}/`))));
+
+        const notBzlPackagesNorBzlDependenciesDirs = Object.keys(lock.packages)
+            .filter(anyPackageDir => !deletedDirs.has(anyPackageDir));
+
+        notBzlPackagesNorBzlDependenciesDirs.forEach(packageDir => {
+            const manifest = manifests.find(candidate => candidate.entry === packageDir);
+
+            //filter lock.packages."".dependecies for bzl dependencies
+            DEPENDENCY_FIELDS.forEach(field => {
+                Object.keys(lock.packages[packageDir][field] || {})
+                    .filter(dependencyName => {
+                        const dependencyDir = resolveEntry(lock.packages, packageDir, dependencyName);
+
+                        return !!dependencyDir && deletedDirs.has(dependencyDir);
+                    })
+                    .forEach(beezeelinxDependencyName => {
+                        delete lock.packages[packageDir][field][beezeelinxDependencyName]; // clean package-lock."".dependencies
+
+                        if (manifest) {
+                            removeReference(manifest.json, beezeelinxDependencyName);
+                        }
+                    });
+            });
+        });
+
+        deletedDirs.forEach(packageDir => delete lock.packages[packageDir]); // clean package-lock.json: example: lock.packages."node_module/bzl-cms..."
+
+        beezeelinxReposDirs.forEach(beezeelinxRepo => removed.add(beezeelinxRepo.slice(beezeelinxRepo.lastIndexOf('node_modules/') + 'node_modules/'.length)));
+    }
+
+    if (lock && lock.dependencies) {
+
+        // lockfileVersion 2 keeps a legacy tree beside `packages`, where a git dependency carries
+        // its URL as version. npm installs from `packages`, so this tree is never the one that
+        // matters: prune it only so no first party URL survives in the file
+
+        /**
+         * @param {Record<string, any>} dependencies
+         */
+        const pruneLegacy = (dependencies) => {
+            Object.keys(dependencies).forEach(name => {
+                const info = dependencies[name];
+
+                if (isBeezeelinxPrivateRepo(info.resolved) || isBeezeelinxPrivateRepo(info.version)) {
+                    delete dependencies[name];
+                    removed.add(name);
+
+                    return;
+                }
+
+                if (info.dependencies) {
+                    pruneLegacy(info.dependencies);
+                }
+            });
+        };
+
+        pruneLegacy(lock.dependencies);
+    }
+
+    // clean the package.json
+    manifests.forEach(manifest => {
+        const entry = lock && lock.packages ? lock.packages[manifest.entry] : undefined;
+
+        DEPENDENCY_FIELDS.forEach(field => {
+            Object.entries(manifest.json[field] || {})
+                .filter(([_name, spec]) => isBeezeelinxPrivateRepo(/** @type string */(spec)))
+                .forEach(([name]) => {
+                    delete manifest.json[field][name];
+                    removeReference(entry, name);
+                    removed.add(name);
+                });
+        });
+    });
+
+    if (removed.size === 0) {
+        return [];
+    }
+
+    for (const manifest of manifests) {
+        await Fs.writeJson(manifest.path, manifest.json, { spaces: 2 });
+    }
+
+    if (lock) {
+        await Fs.writeJson(lockPath, lock, { spaces: 2 });
+    }
+
+    return [...removed].sort();
+}
+
+/**
  *
  *
  * @param {string} modulePath
@@ -377,6 +595,12 @@ async function getLicensesInfo(modulePath) {
                 return true;
             }
         });
+
+        const removed = await removeFirstPartyDependencies(o.path);
+
+        if (removed.length > 0) {
+            Console.log(clc.italic(`Skipping ${removed.length} first party dependencies: ${removed.join(', ')}`));
+        }
 
         Console.log(clc.italic(`Installing package dependencies...`));
 

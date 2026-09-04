@@ -26,6 +26,12 @@ const Console = require('../lib/console');
 const { DateTime } = require('luxon');
 
 const LICENSE_DETECTOR = 'license-detector';
+const FIRST_PARTY_MODULE = /^github\.com\/(beezeelinx|citylinx)(\/|$)/i;
+const MAX_BUFFER = 32 * 1024 * 1024;
+
+/**
+ * @typedef { { project: string; error?: string; matches?: {license: string; confidence: number; file: string; }[]; } } LicenseInfo
+ */
 
 exports.command = 'go <command>';
 exports.description = 'Handle go modules licenses';
@@ -358,34 +364,80 @@ async function listGo3rdPartyLicenses(argv) {
  * @param {string} modulePath
  */
 async function getLicensesInfo(modulePath) {
+
+    Console.log(clc.italic(`Retrieving all direct dependencies of the module...`));
+
+    const moduleDeps = await getModuleDependencies(modulePath);
+    const dependencies = moduleDeps.filter(moduleDep => !moduleDep.Main);
+
     // Get licences of all dependencies
 
-    const { licensesInfo, moduleDeps } = await tmp.withDir(async (o) => {
-        Console.log(clc.italic(`Copying module ${modulePath} to ${o.path}...`));
-        await Fs.copy(modulePath, o.path, { dereference: true });
-        await Fs.remove(Path.resolve(o.path, 'vendor'));
+    const licensesInfo = await tmp.withDir(async (o) => {
 
-        Console.log(clc.italic(`Retrieving all direct dependencies of the module...`));
-        const moduleDeps = await getModuleDependencies(o.path);
+        /** @type {LicenseInfo[]} */
+        const none = [];
 
-        // Download all dependencies into vendor directory
-
-        await exec('go mod vendor', { cwd: o.path });
-
-        const moduleDepsPaths = moduleDeps.filter(moduleDep => !moduleDep.Main)
-            .map(moduleDep => moduleDep.Path);
-
-        if (moduleDepsPaths.length > 0) {
-            Console.log(clc.italic(`Getting license information of the dependencies...`));
-
-            const { stdout } = await exec(`${LICENSE_DETECTOR} -f json ${moduleDepsPaths.join(' ')}`, { cwd: Path.resolve(o.path, 'vendor') });
-
-            /** @type { { project: string; error?: string; matches?: {license: string; confidence: number; file: string; }[]; }[]} */
-            const licensesInfo = JSON.parse(stdout);
-            return { licensesInfo, moduleDeps };
-        } else {
-            return { licensesInfo: [], moduleDeps };
+        if (dependencies.length === 0) {
+            return none;
         }
+
+        // Download the dependencies from a scratch module: the module being checked is never
+        // loaded, so the first party dependencies filtered out above are never fetched and no
+        // credential is needed to reach the private repositories
+
+        await Fs.outputFile(Path.resolve(o.path, 'go.mod'), 'module licensecheck\n');
+
+        Console.log(clc.italic(`Downloading ${dependencies.length} dependencies...`));
+
+        const modules = dependencies.map(moduleDep => `${moduleDep.Path}@${moduleDep.Version}`);
+
+        let stdout = '';
+        let downloadError;
+
+        try {
+            ({ stdout } = await exec(`go mod download -json ${modules.join(' ')}`, { cwd: o.path, maxBuffer: MAX_BUFFER }));
+        } catch (error) {
+            // `go mod download` exits non zero as soon as one module fails: keep the ones that
+            // succeeded and report the others
+            stdout = /** @type {any} */ (error).stdout || '';
+            downloadError = error;
+        }
+        /** @type { {Path: string; Version: string; Dir?: string; Error?: string;}[] } */
+        const downloads = JSON.parse(`[${stdout.replace(/}(\r\n|\r|\n){/g, '},{')}]`);
+
+        downloads.filter(download => !!download.Error)
+            .forEach(download => console.error(clc.red(`Unable to download ${download.Path}@${download.Version}: ${download.Error}`)));
+
+        // license-detector reports back the argument it was given as "project": keep the mapping
+        // to turn the module cache directories into module paths again
+
+        const modulePaths = new Map(downloads.filter(download => !!download.Dir).map(download => [download.Dir, download.Path]));
+
+        if (modulePaths.size === 0) {
+            if (downloadError) {
+                throw downloadError;
+            }
+            return none;
+        }
+
+        Console.log(clc.italic(`Getting license information of the dependencies...`));
+
+        const { stdout: detected } = await exec(`${LICENSE_DETECTOR} -f json ${[...modulePaths.keys()].join(' ')}`, { maxBuffer: MAX_BUFFER });
+
+        /** @type {LicenseInfo[]} */
+        const licensesInfo = JSON.parse(detected);
+
+        licensesInfo.forEach(licenseInfo => {
+            const modulePath = modulePaths.get(licenseInfo.project);
+
+            if (!modulePath) {
+                throw new Error(`license-detector reported an unknown project "${licenseInfo.project}"`);
+            }
+
+            licenseInfo.project = modulePath;
+        });
+
+        return licensesInfo;
 
     }, { unsafeCleanup: true });
 
@@ -428,46 +480,92 @@ async function getLicensesInfo(modulePath) {
 }
 
 /**
+ * Test whether a `replace` directive applies to a required module: a directive without a version on
+ * its left hand side replaces every version of the module, one with a version only that version.
  *
+ * @param { {Old: {Path: string; Version?: string;};} } replacement
+ * @param { {Path: string; Version: string;} } required
+ * @return {boolean}
+ */
+function replaces(replacement, required) {
+    return replacement.Old.Path === required.Path
+        && (!replacement.Old.Version || replacement.Old.Version === required.Version);
+}
+
+/**
+ * Read the direct dependencies of a module from its go.mod.
+ *
+ * `go mod edit -json` is purely local: unlike `go list -m all` it does not load the module graph,
+ * so the first party dependencies are filtered out before anything is fetched.
  *
  * @param {string} modulePath
+ * @return { Promise<{Main?: boolean; Path: string; Version: string;}[]> }
  */
 async function getModuleDependencies(modulePath) {
 
-    await exec('go mod tidy', { cwd: modulePath });
+    const { stdout } = await exec('go mod edit -json', { cwd: modulePath, maxBuffer: MAX_BUFFER });
 
-    const { stdout } = await exec('go list -json -m all', { cwd: modulePath });
+    /** @type { {Module: {Path: string;}; Require?: {Path: string; Version: string; Indirect?: boolean;}[]; Replace?: {Old: {Path: string; Version?: string;}; New: {Path: string; Version?: string;};}[]; } } */
+    const goMod = JSON.parse(stdout);
 
-    const moduleDepsJson = `[${stdout.replace(/}(\r\n|\r|\n){/g, '},{')}]`;
+    const replacements = goMod.Replace || [];
+    const directRequires = (goMod.Require || []).filter(required => !required.Indirect);
 
-    /** @type { {Indirect?: boolean; Main?: boolean; Path: string; Version: string; Replace?: { Path: string; Dir: string;}; }[] } */
-    let moduleDeps = JSON.parse(moduleDepsJson);
+    // Only the replacements actually applying to a direct dependency are of interest: a directive
+    // left over for a module that is not required is a no op for the build, and so for the report
 
-    // Handle replacements
+    const applied = replacements.filter(replacement => directRequires.some(required => replaces(replacement, required)));
 
-    const modulesReplace = moduleDeps.filter(moduleDep => {
-        return !!moduleDep.Replace && moduleDep.Replace.Dir.startsWith(modulePath);
-    });
+    // Handle the replacements pointing at a directory inside the module being checked: a
+    // replacement without a version is a filesystem path, relative to the go.mod holding it
 
-    const replace$ = modulesReplace.map(moduleReplace => {
-        return getModuleDependencies(moduleReplace.Replace.Dir);
-    });
+    const replace$ = applied
+        .filter(replacement => !replacement.New.Version)
+        .map(replacement => Path.resolve(modulePath, replacement.New.Path))
+        .filter(dir => dir.startsWith(modulePath))
+        .map(dir => getModuleDependencies(dir));
 
     const replace = await Promise.all(replace$);
 
-    // Keep only direct dependencies
+    // A replaced dependency is reported through its replacement, which is the code that actually
+    // ships. A replacement with a version is a module of its own: it has to be downloaded and
+    // scanned like any other dependency. One without a version is source, either part of the module
+    // and covered by the recursion above, or out of reach
 
-    moduleDeps = moduleDeps.filter(moduleDep => !moduleDep.Indirect && !moduleDep.Replace);
+    /** @type { {Path: string; Version: string;}[] } */
+    const replacementDeps = applied
+        .filter(replacement => !!replacement.New.Version)
+        .map(replacement => ({ Path: replacement.New.Path, Version: /** @type {string} */(replacement.New.Version) }));
 
-    // Merge replace dependencies
+    applied
+        .filter(replacement => !replacement.New.Version)
+        .map(replacement => Path.resolve(modulePath, replacement.New.Path))
+        .filter(dir => !dir.startsWith(modulePath))
+        .forEach(dir => console.error(clc.yellow(`"${dir}" replaces a dependency of ${goMod.Module.Path} but is outside the module: its license cannot be checked`)));
 
-    moduleDeps = _.uniqBy([...moduleDeps, ..._.flattenDeep(replace).filter(rep => !rep.Main)], 'Path');
+    // Keep only the direct dependencies that are not replaced
 
-    // Remove BeeZeeLinx packages
+    /** @type { {Main?: boolean; Path: string; Version: string;}[] } */
+    let moduleDeps = directRequires
+        .filter(required => !replacements.some(replacement => replaces(replacement, required)))
+        .map(required => ({ Path: required.Path, Version: required.Version }));
 
-    moduleDeps = _.sortBy(moduleDeps.filter(moduleDep => !moduleDep.Path.includes('beezeelinx') || moduleDep.Main), 'Path');
+    // Merge replace dependencies. The replacements come first: `uniqBy` keeps the first occurrence
+    // and a replacement version wins over a plain `require` of the same module
 
-    return moduleDeps;
+    moduleDeps = _.uniqBy(
+        [
+            { Path: goMod.Module.Path, Version: '', Main: true },
+            ...replacementDeps,
+            ...moduleDeps,
+            ..._.flattenDeep(replace).filter(rep => !rep.Main)
+        ],
+        'Path'
+    );
+
+    // Remove BeeZeeLinx and CityLinx packages
+
+    return _.sortBy(moduleDeps.filter(moduleDep => moduleDep.Main || !FIRST_PARTY_MODULE.test(moduleDep.Path)), 'Path');
 }
 
 /**
