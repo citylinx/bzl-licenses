@@ -463,9 +463,6 @@ async function removeFirstPartyDependencies(dir) {
                 });
             }
         }
-    }
-
-    if (lock && lock.packages) {
 
         // lockfileVersion 2 and 3: a flat map of "node_modules/..." entries. A workspace directory
         // is local source rather than something npm fetches, so it is never first party
@@ -480,7 +477,7 @@ async function removeFirstPartyDependencies(dir) {
         // Anything nested under a beezeelinxRepos is only reachable through it and should be deleted
 
         const deletedDirs = new Set(Object.keys(lock.packages)
-            .filter(packageDir => beezeelinxReposDirs.some(beezeelinxRepo => packageDir === beezeelinxRepo || packageDir.startsWith(`${beezeelinxReposDirs}/`))));
+            .filter(packageDir => beezeelinxReposDirs.some(beezeelinxRepo => packageDir === beezeelinxRepo || packageDir.startsWith(`${beezeelinxRepo}/`))));
 
         const notBzlPackagesNorBzlDependenciesDirs = Object.keys(lock.packages)
             .filter(anyPackageDir => !deletedDirs.has(anyPackageDir));
