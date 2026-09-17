@@ -20,6 +20,16 @@
         echo "$BZL_SOURCE_URL"
     }
 
+    bzl_ref() {
+        local BZL_GIT_REF
+        BZL_GIT_REF="$BZL_REF"
+        if [ -z "$BZL_GIT_REF" ]; then
+            # Default branch of the remote, as before
+            BZL_GIT_REF="HEAD"
+        fi
+        echo "$BZL_GIT_REF"
+    }
+
     bzl_default_install_dir() {
         local TEMP_DIR
         TEMP_DIR=$(dirname "$(mktemp -u)")
@@ -44,6 +54,13 @@
             echo "=> bzl-licenses is already installed in $INSTALL_DIR, trying to update using git"
             command printf '\r=> '
             fetch_error="Failed to update bzl-licenses with latest version, run 'git fetch' in $INSTALL_DIR yourself."
+
+            # The remote of an existing install dir was set when it was created: refresh it so that
+            # a change of BZL_SOURCE is taken into account without having to remove the directory
+            command git --git-dir="${INSTALL_DIR}/.git" remote set-url origin "$(bzl_source)" || {
+                echo >&2 'Failed to set the URL of the remote "origin". Please report this!'
+                exit 2
+            }
         else
             fetch_error="Failed to fetch origin with latest version. Please report this!"
             echo "=> Downloading bzl-licenses from git to '$INSTALL_DIR'"
@@ -69,7 +86,7 @@
             fi
         fi
 
-        if ! command git --git-dir="$INSTALL_DIR"/.git --work-tree="$INSTALL_DIR" fetch origin --depth=1; then
+        if ! command git --git-dir="$INSTALL_DIR"/.git --work-tree="$INSTALL_DIR" fetch origin --depth=1 "$(bzl_ref)"; then
             echo >&2 "$fetch_error"
             exit 1
         fi
@@ -80,7 +97,7 @@
         }
 
         if [ -n "$(command git --git-dir="$INSTALL_DIR"/.git --work-tree="$INSTALL_DIR" show-ref refs/heads/master)" ]; then
-            if command git --git-dir="$INSTALL_DIR"/.git --work-tree="$INSTALL_DIR" branch --quiet 2>/dev/null; then
+            if command git --git-dir="$INSTALL_DIR"/.git --work-tree="$INSTALL_DIR" branch --quiet >/dev/null 2>&1; then
                 command git --git-dir="$INSTALL_DIR"/.git --work-tree="$INSTALL_DIR" branch --quiet -D master >/dev/null 2>&1
             else
                 echo >&2 "Your version of git is out of date. Please update it!"
@@ -175,7 +192,7 @@
     }
 
     bzl_reset() {
-        unset -f bzl_reset bzl_run_docker bzl_has bzl_get_git_repo bzl_install_dir bzl_default_install_dir bzl_source
+        unset -f bzl_reset bzl_run_docker bzl_has bzl_get_git_repo bzl_install_dir bzl_default_install_dir bzl_source bzl_ref
     }
 
     [ "_$BZL_ENV" = "_testing" ] || bzl_run_docker "${@}"
