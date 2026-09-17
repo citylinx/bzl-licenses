@@ -20,13 +20,19 @@ const Promisify = require('util').promisify;
 const exec = Promisify(require('child_process').exec);
 const licenceChecker = require('license-checker');
 const licenseTypes = require('../lib/licenses_types');
+const { isFirstParty } = require('../lib/first_party');
 const columnify = require('columnify');
 const { stringify: csvStringify } = require('csv-stringify/sync');
 const { DateTime } = require('luxon');
 
-const BEEZEELINX_PRIVATE_REPOSITORY = /github\.com[:/](beezeelinx|citylinx)\//i;
-const BEEZEELINX_PRIVATE_REPOSITORY_SHORTHAND = /^github:(beezeelinx|citylinx)\//i;
 const DEPENDENCY_FIELDS = ['dependencies', 'devDependencies', 'optionalDependencies'];
+const GITHUB_SHORTHAND = /^github:/i;
+
+/**
+ * A package license information, augmented with the outcome of the white list lookup
+ *
+ * @typedef { licenceChecker.ModuleInfo & { whiteListed?: boolean; } } PackageLicenseInfo
+ */
 
 exports.command = 'npm <command>';
 exports.description = 'Handle npm modules licenses';
@@ -159,7 +165,7 @@ async function saveNpm3rdPartyLicenses(argv) {
                 licenseError = 'Missing license information';
                 console.error(clc.red(`Package ${licenseInfo.name} is missing a license information`));
                 hasLicenseError = true;
-            } else if (!licenseTypes.isValidLicense(licenseName) && !licenseTypes.isWhiteListed(licenseInfo.name)) {
+            } else if (!licenseTypes.isValidLicense(licenseName) && !licenseInfo.whiteListed) {
                 licenseError = 'Invalid/unknown license';
                 console.error(clc.red(`Invalid license ${licenseName} for the package ${licenseInfo.name}`));
                 hasLicenseError = true;
@@ -247,7 +253,7 @@ async function listNpm3rdPartyLicenses(argv) {
                 licenseError = 'Missing license information';
             } else {
                 const isValid = licenseTypes.isValidLicense(licenseName);
-                const isWhiteListed = licenseTypes.isWhiteListed(licenseInfo.name);
+                const isWhiteListed = !!licenseInfo.whiteListed;
                 const info = await isOlderThan1Week(licenseInfo);
                 if ((isValid || isWhiteListed) && info.valid) {
                     validity = 0;
@@ -283,7 +289,7 @@ async function listNpm3rdPartyLicenses(argv) {
                 if (!licenseName) {
                     console.error(clc.red(`Package ${licenseInfo.name} is missing a license information`));
                     hasLicenseError = true;
-                } else if (!licenseTypes.isValidLicense(licenseName) && !licenseTypes.isWhiteListed(licenseInfo.name)) {
+                } else if (!licenseTypes.isValidLicense(licenseName) && !licenseInfo.whiteListed) {
                     console.error(clc.red(`Invalid license ${licenseName} for the package ${licenseInfo.name}`));
                     hasLicenseError = true;
                 }
@@ -357,12 +363,26 @@ async function isOlderThan1Week(packageInfo) {
 }
 
 /**
- * Test whether a dependency specifier or a resolved URL points at a first party repository
+ * Test whether a path can be copied: a directory has to be listed and walked into, a file only
+ * read. A symbolic link is copied as a link, its target is never read
  *
- * @param {string} [spec]
+ * @param {string} src
+ * @return {boolean}
  */
-function isBeezeelinxPrivateRepo(spec) {
-    return !!spec && (BEEZEELINX_PRIVATE_REPOSITORY.test(spec) || BEEZEELINX_PRIVATE_REPOSITORY_SHORTHAND.test(spec));
+function isReadable(src) {
+    try {
+        const stat = Fs.lstatSync(src);
+
+        if (stat.isSymbolicLink()) {
+            return true;
+        }
+
+        Fs.accessSync(src, stat.isDirectory() ? Fs.constants.R_OK | Fs.constants.X_OK : Fs.constants.R_OK);
+
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 /**
@@ -472,7 +492,8 @@ async function removeFirstPartyDependencies(dir) {
         // packageName  -> ex: cli-color
 
         const beezeelinxReposDirs = Object.keys(lock.packages)
-            .filter(packageDir => packageDir.includes('node_modules/') && isBeezeelinxPrivateRepo(lock.packages[packageDir].resolved));
+            .filter(packageDir => packageDir.includes('node_modules/')
+                && (isFirstParty(packageDir) || isFirstParty(lock.packages[packageDir].resolved)));
 
         // Anything nested under a beezeelinxRepos is only reachable through it and should be deleted
 
@@ -521,7 +542,7 @@ async function removeFirstPartyDependencies(dir) {
             Object.keys(dependencies).forEach(name => {
                 const info = dependencies[name];
 
-                if (isBeezeelinxPrivateRepo(info.resolved) || isBeezeelinxPrivateRepo(info.version)) {
+                if (isFirstParty(name) || isFirstParty(info.resolved) || isFirstParty(info.version)) {
                     delete dependencies[name];
                     removed.add(name);
 
@@ -543,7 +564,7 @@ async function removeFirstPartyDependencies(dir) {
 
         DEPENDENCY_FIELDS.forEach(field => {
             Object.entries(manifest.json[field] || {})
-                .filter(([_name, spec]) => isBeezeelinxPrivateRepo(/** @type string */(spec)))
+                .filter(([name, spec]) => isFirstParty(name) || isFirstParty(/** @type string */(spec)))
                 .forEach(([name]) => {
                     delete manifest.json[field][name];
                     removeReference(entry, name);
@@ -589,6 +610,15 @@ async function getLicensesInfo(modulePath) {
                 if (src.indexOf('node_modules') !== -1 || src.indexOf('.tmp') !== -1 || src.indexOf('.git') !== -1) {
                     return false;
                 }
+
+                // The copy only exists to install the dependencies of the module: leave behind
+                // whatever cannot be read rather than failing the whole check on it.
+
+                if (!isReadable(src)) {
+                    console.error(clc.yellow(`Skipping "${Path.relative(modulePath, src)}": permission denied`));
+                    return false;
+                }
+
                 return true;
             }
         });
@@ -625,33 +655,38 @@ async function getLicensesInfo(modulePath) {
         });
 
         // Keep only the direct dependencies: as the packages list is flatten, indirect dependencies are visible in node_modules
-        // Remove BeeZeeLinx packages and packages from github
+        // Remove first party packages and packages from github
 
-        const directDependencies = Object.keys(packageJson['dependencies']) || [];
+        const directDependencies = new Map(Object.entries(packageJson['dependencies'] || {}));
 
         Object.keys(packages).forEach(packageNameVersion => {
-            const packageInfo = packages[packageNameVersion];
+            const packageInfo = /** @type {PackageLicenseInfo} */ (packages[packageNameVersion]);
+            const packageName = packageInfo.name || '';
 
-            if ((packageInfo.repository || '').includes('beezeelinx') || directDependencies.indexOf(packageInfo.name) === -1) {
+            if (!directDependencies.has(packageName)) {
                 delete packages[packageNameVersion];
                 return;
             }
 
-            if (Object.entries(packageJson['dependencies']).filter(([name, version]) => name === packageInfo.name && version.match(/^github:/)).length !== 0) {
+            const spec = /** @type string */ (directDependencies.get(packageName));
+            if (isFirstParty(packageName) || isFirstParty(packageInfo.repository) || isFirstParty(spec) || GITHUB_SHORTHAND.test(spec)) {
                 delete packages[packageNameVersion];
                 return;
             }
 
-            // Test if the package is white listed and get its license
+            // Test if the package is white listed for the license it has been reported with: an
+            // exception is granted for a given package *and* a given license, so a package that
+            // gets relicensed loses it
 
             const whiteListedLicense = licenseTypes.getWhiteListedLicense(packageInfo.name, /** @type string */(packageInfo.licenses));
 
             if (whiteListedLicense) {
                 packageInfo.licenses = whiteListedLicense;
+                packageInfo.whiteListed = true;
             }
         });
 
-        return { licensesInfo: packages };
+        return { licensesInfo: /** @type { Record<string, PackageLicenseInfo> } */ (packages) };
     }, { unsafeCleanup: true });
 
     return { packageInfo: packageJson, licenses: licensesInfo };
