@@ -22,15 +22,19 @@ const { stringify: csvStringify } = require('csv-stringify/sync');
 const clc = require('cli-color');
 const hasBin = require('hasbin');
 const licenseTypes = require('../lib/licenses_types');
+const { isFirstParty } = require('../lib/first_party');
 const Console = require('../lib/console');
 const { DateTime } = require('luxon');
 
 const LICENSE_DETECTOR = 'license-detector';
-const FIRST_PARTY_MODULE = /^github\.com\/(beezeelinx|citylinx)(\/|$)/i;
 const MAX_BUFFER = 32 * 1024 * 1024;
+const NOT_CHECKED = 'Could not check this module';
 
 /**
- * @typedef { { project: string; error?: string; matches?: {license: string; confidence: number; file: string; }[]; } } LicenseInfo
+ * `unavailable` marks a module nothing could be read from, because its download failed: it has no
+ * license information, and no publication date either
+ *
+ * @typedef { { project: string; error?: string; unavailable?: boolean; whiteListed?: boolean; matches?: {license: string; confidence: number; file: string; }[]; } } LicenseInfo
  */
 
 exports.command = 'go <command>';
@@ -122,9 +126,8 @@ exports.builder = (yargs) => {
                         if (!argv.path || !Fs.pathExistsSync(argv.path) || !Fs.pathExistsSync(Path.resolve(argv.path, 'go.mod'))) {
                             throw new Error('Invalid Go module directory path');
                         }
-                        if (argv.csv && !Fs.pathExistsSync(argv.csv)) {
-                            throw new Error('Invalid CSV file path');
-
+                        if (argv.csv && !Fs.pathExistsSync(Path.dirname(Path.resolve(argv.csv)))) {
+                            throw new Error(`Directory ${Path.dirname(Path.resolve(argv.csv))} does not exist`);
                         }
                         if (argv.quiet) {
                             Console.enable(false);
@@ -171,13 +174,14 @@ async function saveGo3rdPartyLicenses(argv) {
             if (licenseError) {
                 console.error(`Error retrieving license of package ${licenseInfo.name}: ${licenseError}`);
                 hasLicenseError = true;
-            } else if (!licenseTypes.isValidLicense(licenseName) && !licenseTypes.isWhiteListed(licenseInfo.name)) {
+            } else if (!licenseTypes.isValidLicense(licenseName) && !licenseInfo.license?.whiteListed) {
                 console.error(`Invalid license ${licenseName} for the package ${licenseInfo.name}`);
                 hasLicenseError = true;
             }
 
-            const info = await isOlderThan1Week(licenseInfo);
-            if (!info.valid) {
+            const info = licenseInfo.license.unavailable ? undefined : await isOlderThan1Week(licenseInfo);
+
+            if (info && !info.valid) {
                 console.error(clc.red(`Package ${licenseInfo.name} version ${licenseInfo.version} is less thant 1 week old (${info.date.toISODate()})`));
                 hasLicenseError = true;
             }
@@ -186,7 +190,7 @@ async function saveGo3rdPartyLicenses(argv) {
                 Package: licenseInfo.name,
                 Version: licenseInfo.version,
                 License: licenseName || '~Unknown License~~',
-                Date: info.date.toISODate(),
+                Date: info ? info.date.toISODate() : '',
                 error: licenseError,
             };
         }));
@@ -258,10 +262,10 @@ async function listGo3rdPartyLicenses(argv) {
             let date = '';
 
             if (!licenseName) {
-                licenseError = 'Missing license information';
+                licenseError = licenseError || 'Missing license information';
             } else {
                 const isValid = licenseTypes.isValidLicense(licenseName);
-                const isWhiteListed = licenseTypes.isWhiteListed(licenseInfo.name);
+                const isWhiteListed = !!licenseInfo.license?.whiteListed;
                 const olderThan1Week = await isOlderThan1Week(licenseInfo);
                 if ((isValid || isWhiteListed) && olderThan1Week.valid) {
                     validity = 0;
@@ -297,9 +301,13 @@ async function listGo3rdPartyLicenses(argv) {
                 if (licenseError) {
                     console.error(`Error retrieving license of package ${licenseInfo.name}: ${licenseError}`);
                     hasLicenseError = true;
-                } else if (!licenseTypes.isValidLicense(licenseName) && !licenseTypes.isWhiteListed(licenseInfo.name)) {
+                } else if (!licenseTypes.isValidLicense(licenseName) && !licenseInfo.license?.whiteListed) {
                     console.error(`Invalid license ${licenseName} for the package ${licenseInfo.name}`);
                     hasLicenseError = true;
+                }
+
+                if (licenseInfo.license.unavailable) {
+                    return;
                 }
 
                 const info = await isOlderThan1Week(licenseInfo);
@@ -456,17 +464,30 @@ async function getLicensesInfo(modulePath) {
                 return licenceInfo.project === moduleDep.Path;
             });
 
-            if (licenseInfo) {
-                // Test if the package is white listed and get its license
-                const whiteListedLicense = licenseTypes.getWhiteListedLicense(licenseInfo.project, licenseInfo.matches && licenseInfo.matches[0] ? licenseInfo.matches[0].license : '');
+            // Nothing was detected for the module: its download failed above, and it was reported
+            // there. Carry the error instead of a missing license information, so the reports have
+            // something to print rather than nothing to read
 
-                if (licenseInfo.error && whiteListedLicense) {
-                    delete licenseInfo.error;
-                    licenseInfo.matches = [{ license: whiteListedLicense, confidence: 1.0, file: undefined }];
-                }
-                if ((!licenseInfo.matches || !licenseInfo.matches[0]) && !whiteListedLicense) {
-                    licenseInfo.error = 'Missing license information';
-                }
+            if (!licenseInfo) {
+                return {
+                    name: moduleDep.Path,
+                    version: moduleDep.Version,
+                    license: /** @type {LicenseInfo} */ ({ project: moduleDep.Path, error: NOT_CHECKED, unavailable: true })
+                };
+            }
+
+            // Test if the package is white listed for the license that has actually been
+            // detected: an exception is granted for a given package *and* a given license, so a
+            // package that gets relicensed loses it
+            const detectedLicense = licenseInfo.matches && licenseInfo.matches[0] ? licenseInfo.matches[0].license : '';
+            const whiteListedLicense = licenseTypes.getWhiteListedLicense(licenseInfo.project, detectedLicense);
+
+            if (whiteListedLicense) {
+                delete licenseInfo.error;
+                licenseInfo.matches = [{ license: whiteListedLicense, confidence: 1.0, file: undefined }];
+                licenseInfo.whiteListed = true;
+            } else if (!licenseInfo.matches || !licenseInfo.matches[0]) {
+                licenseInfo.error = 'Missing license information';
             }
 
             return {
@@ -493,15 +514,30 @@ function replaces(replacement, required) {
 }
 
 /**
+ * Test whether a directory is a root directory itself or sits inside it. Comparing the paths as
+ * plain strings would not do: "/repo/application" is not inside "/repo/app"
+ *
+ * @param {string} root
+ * @param {string} dir
+ * @return {boolean}
+ */
+function isInside(root, dir) {
+    const relative = Path.relative(root, dir);
+    return !Path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${Path.sep}`);
+}
+
+/**
  * Read the direct dependencies of a module from its go.mod.
  *
  * `go mod edit -json` is purely local: unlike `go list -m all` it does not load the module graph,
  * so the first party dependencies are filtered out before anything is fetched.
  *
  * @param {string} modulePath
+ * @param {string} [rootPath]
+ * @param {Set<string>} [visited] Module directories already read
  * @return { Promise<{Main?: boolean; Path: string; Version: string;}[]> }
  */
-async function getModuleDependencies(modulePath) {
+async function getModuleDependencies(modulePath, rootPath = modulePath, visited = new Set([modulePath])) {
 
     const { stdout } = await exec('go mod edit -json', { cwd: modulePath, maxBuffer: MAX_BUFFER });
 
@@ -516,16 +552,23 @@ async function getModuleDependencies(modulePath) {
 
     const applied = replacements.filter(replacement => directRequires.some(required => replaces(replacement, required)));
 
-    // Handle the replacements pointing at a directory inside the module being checked: a
-    // replacement without a version is a filesystem path, relative to the go.mod holding it
+    // Handle the replacements pointing at a directory inside the checkout: a replacement without a
+    // version is a filesystem path, relative to the go.mod holding it. The containment is tested
+    // against the root, not against the module being read: a nested module replacing one of its
+    // siblings still points at code that is part of the checkout
 
-    const replace$ = applied
+    const localReplacements = applied
         .filter(replacement => !replacement.New.Version)
-        .map(replacement => Path.resolve(modulePath, replacement.New.Path))
-        .filter(dir => dir.startsWith(modulePath))
-        .map(dir => getModuleDependencies(dir));
+        .map(replacement => Path.resolve(modulePath, replacement.New.Path));
 
-    const replace = await Promise.all(replace$);
+    // A directory is read once: several directives may point at the same module, and a module
+    // replacing itself, or two modules replacing each other, would otherwise never end
+
+    const toRead = _.uniq(localReplacements.filter(dir => isInside(rootPath, dir) && !visited.has(dir)));
+
+    toRead.forEach(dir => visited.add(dir));
+
+    const replace = await Promise.all(toRead.map(dir => getModuleDependencies(dir, rootPath, visited)));
 
     // A replaced dependency is reported through its replacement, which is the code that actually
     // ships. A replacement with a version is a module of its own: it has to be downloaded and
@@ -537,10 +580,8 @@ async function getModuleDependencies(modulePath) {
         .filter(replacement => !!replacement.New.Version)
         .map(replacement => ({ Path: replacement.New.Path, Version: /** @type {string} */(replacement.New.Version) }));
 
-    applied
-        .filter(replacement => !replacement.New.Version)
-        .map(replacement => Path.resolve(modulePath, replacement.New.Path))
-        .filter(dir => !dir.startsWith(modulePath))
+    localReplacements
+        .filter(dir => !isInside(rootPath, dir))
         .forEach(dir => console.error(clc.yellow(`"${dir}" replaces a dependency of ${goMod.Module.Path} but is outside the module: its license cannot be checked`)));
 
     // Keep only the direct dependencies that are not replaced
@@ -565,7 +606,7 @@ async function getModuleDependencies(modulePath) {
 
     // Remove BeeZeeLinx and CityLinx packages
 
-    return _.sortBy(moduleDeps.filter(moduleDep => moduleDep.Main || !FIRST_PARTY_MODULE.test(moduleDep.Path)), 'Path');
+    return _.sortBy(moduleDeps.filter(moduleDep => moduleDep.Main || !isFirstParty(moduleDep.Path)), 'Path');
 }
 
 /**
