@@ -8,10 +8,10 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN \
     apt-get -qq update && \
     apt-get install -yq --no-install-recommends \
-        software-properties-common \
-        curl \
-        gnupg \
-        git \
+    software-properties-common \
+    curl \
+    gnupg \
+    git \
     && \
     apt-get clean && \
     apt-get autoremove && \
@@ -20,8 +20,8 @@ RUN \
 
 ENV PATH=$PATH:/usr/local/go/bin
 
-RUN curl -sS https://dl.google.com/go/go1.24.0.linux-amd64.tar.gz -o go1.24.0.linux-amd64.tar.gz && \
-    rm -rf /usr/local/go && tar -C /usr/local -xzf go1.24.0.linux-amd64.tar.gz
+RUN curl -sS https://dl.google.com/go/go1.27.1.linux-amd64.tar.gz -o go1.27.1.linux-amd64.tar.gz && \
+    rm -rf /usr/local/go && tar -C /usr/local -xzf go1.27.1.linux-amd64.tar.gz
 
 # Install latest node 18.x without dev dependencies
 
