@@ -20,9 +20,19 @@ const Promisify = require('util').promisify;
 const exec = Promisify(require('child_process').exec);
 const licenceChecker = require('license-checker');
 const licenseTypes = require('../lib/licenses_types');
+const { isFirstParty } = require('../lib/first_party');
 const columnify = require('columnify');
 const { stringify: csvStringify } = require('csv-stringify/sync');
 const { DateTime } = require('luxon');
+
+const DEPENDENCY_FIELDS = ['dependencies', 'devDependencies', 'optionalDependencies'];
+const GITHUB_SHORTHAND = /^github:/i;
+
+/**
+ * A package license information, augmented with the outcome of the white list lookup
+ *
+ * @typedef { licenceChecker.ModuleInfo & { whiteListed?: boolean; } } PackageLicenseInfo
+ */
 
 exports.command = 'npm <command>';
 exports.description = 'Handle npm modules licenses';
@@ -155,7 +165,7 @@ async function saveNpm3rdPartyLicenses(argv) {
                 licenseError = 'Missing license information';
                 console.error(clc.red(`Package ${licenseInfo.name} is missing a license information`));
                 hasLicenseError = true;
-            } else if (!licenseTypes.isValidLicense(licenseName) && !licenseTypes.isWhiteListed(licenseInfo.name)) {
+            } else if (!licenseTypes.isValidLicense(licenseName) && !licenseInfo.whiteListed) {
                 licenseError = 'Invalid/unknown license';
                 console.error(clc.red(`Invalid license ${licenseName} for the package ${licenseInfo.name}`));
                 hasLicenseError = true;
@@ -243,7 +253,7 @@ async function listNpm3rdPartyLicenses(argv) {
                 licenseError = 'Missing license information';
             } else {
                 const isValid = licenseTypes.isValidLicense(licenseName);
-                const isWhiteListed = licenseTypes.isWhiteListed(licenseInfo.name);
+                const isWhiteListed = !!licenseInfo.whiteListed;
                 const info = await isOlderThan1Week(licenseInfo);
                 if ((isValid || isWhiteListed) && info.valid) {
                     validity = 0;
@@ -279,7 +289,7 @@ async function listNpm3rdPartyLicenses(argv) {
                 if (!licenseName) {
                     console.error(clc.red(`Package ${licenseInfo.name} is missing a license information`));
                     hasLicenseError = true;
-                } else if (!licenseTypes.isValidLicense(licenseName) && !licenseTypes.isWhiteListed(licenseInfo.name)) {
+                } else if (!licenseTypes.isValidLicense(licenseName) && !licenseInfo.whiteListed) {
                     console.error(clc.red(`Invalid license ${licenseName} for the package ${licenseInfo.name}`));
                     hasLicenseError = true;
                 }
@@ -353,6 +363,232 @@ async function isOlderThan1Week(packageInfo) {
 }
 
 /**
+ * Test whether a path can be copied: a directory has to be listed and walked into, a file only
+ * read. A symbolic link is copied as a link, its target is never read
+ *
+ * @param {string} src
+ * @return {boolean}
+ */
+function isReadable(src) {
+    try {
+        const stat = Fs.lstatSync(src);
+
+        if (stat.isSymbolicLink()) {
+            return true;
+        }
+
+        Fs.accessSync(src, stat.isDirectory() ? Fs.constants.R_OK | Fs.constants.X_OK : Fs.constants.R_OK);
+
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Resolve the lock entry a dependency edge points at, following the `node_modules` lookup rules:
+ * from the entry holding the edge, walk up until a matching entry is found.
+ *
+ * @param {Record<string, any>} packages `packages` map of the lock file
+ * @param {string} holder Key of the entry holding the edge, '' for the root package
+ * @param {string} name Name of the dependency
+ * @return {string | undefined} Key of the entry the edge resolves to, undefined when unresolved
+ */
+function resolveEntry(packages, holder, name) {
+    let prefix = holder;
+
+    for (; ;) {
+        const candidate = prefix ? `${prefix}/node_modules/${name}` : `node_modules/${name}`;
+
+        if (packages[candidate]) {
+            return candidate;
+        }
+
+        if (!prefix) {
+            return undefined;
+        }
+
+        const nested = prefix.lastIndexOf('/node_modules/');
+
+        if (nested !== -1) {
+            prefix = prefix.slice(0, nested);
+        } else if (prefix.includes('/')) {
+            prefix = prefix.slice(0, prefix.lastIndexOf('/'));
+        } else {
+            prefix = '';
+        }
+    }
+}
+
+/**
+ * Remove the first party dependencies from the copied package.json and package-lock.json, so that
+ * `npm ci` never has to authenticate against the private BeeZeeLinx/CityLinx repositories.
+ *
+ * Those packages are already excluded from the report (see getLicensesInfo) and only the direct
+ * dependencies are reported, so nothing that would be printed is lost.
+ *
+ * @param {string} dir Directory holding the copy of the module
+ * @return {Promise<string[]>} Names of the removed dependencies
+ */
+async function removeFirstPartyDependencies(dir) {
+    const packageJsonPath = Path.resolve(dir, 'package.json');
+    const lockPath = Path.resolve(dir, 'package-lock.json');
+
+    const packageJson = await Fs.readJson(packageJsonPath, { encoding: 'utf8' });
+    const lock = (await Fs.pathExists(lockPath)) ? await Fs.readJson(lockPath, { encoding: 'utf8' }) : undefined;
+
+    // lockfileVersion 1 has no `packages` map, so its legacy tree is the only representation and
+    // the one npm installs from. Reject it rather than pruning it: regenerating the lock with
+    // npm 9 or later produces a supported format
+
+    if (lock && !lock.packages) {
+        throw new Error(`Unsupported lock file ${lockPath}: lockfileVersion ${lock.lockfileVersion} has no "packages" map, regenerate it with npm 9 or later`);
+    }
+
+    /** @type {Set<string>} */
+    const removed = new Set();
+
+    // Remove a dependency from a package.json or from a lock entry. Leaving the reference behind
+    // makes `npm ci` reject the lock file, or resolve the dependency on its own and clone the
+    // private repository.
+
+    const removeReference = (holder, name) => {
+        DEPENDENCY_FIELDS.forEach(field => {
+            if (holder && holder[field]) {
+                delete holder[field][name];
+            }
+        });
+    };
+
+    // A package.json and the lock entry mirroring it have to lose an edge together, or `npm ci`
+    // reports them out of sync: pair them up, the root package.json with the '' entry and the
+    // package.json of a workspace with the entry of its directory
+
+    /** @type { {path: string; json: any; entry: string;}[] } */
+    const manifests = [{ path: packageJsonPath, json: packageJson, entry: '' }];
+
+    if (lock && lock.packages) {
+
+        // Any key without a "node_modules/" segment is a workspace directory
+
+        const workspaces = Object.keys(lock.packages).filter(entry => entry && !entry.includes('node_modules/'));
+        for (const workspace of workspaces) {
+            const manifestPath = Path.resolve(dir, workspace, 'package.json');
+
+            if (await Fs.pathExists(manifestPath)) {
+                manifests.push({
+                    path: manifestPath,
+                    json: await Fs.readJson(manifestPath, { encoding: 'utf8' }),
+                    entry: workspace
+                });
+            }
+        }
+
+        // lockfileVersion 2 and 3: a flat map of "node_modules/..." entries. A workspace directory
+        // is local source rather than something npm fetches, so it is never first party
+
+        //Nomenclature:
+        // packageDir   -> ex: node_modules/cli-color
+        // packageName  -> ex: cli-color
+
+        const beezeelinxReposDirs = Object.keys(lock.packages)
+            .filter(packageDir => packageDir.includes('node_modules/')
+                && (isFirstParty(packageDir) || isFirstParty(lock.packages[packageDir].resolved)));
+
+        // Anything nested under a beezeelinxRepos is only reachable through it and should be deleted
+
+        const deletedDirs = new Set(Object.keys(lock.packages)
+            .filter(packageDir => beezeelinxReposDirs.some(beezeelinxRepo => packageDir === beezeelinxRepo || packageDir.startsWith(`${beezeelinxRepo}/`))));
+
+        const notBzlPackagesNorBzlDependenciesDirs = Object.keys(lock.packages)
+            .filter(anyPackageDir => !deletedDirs.has(anyPackageDir));
+
+        notBzlPackagesNorBzlDependenciesDirs.forEach(packageDir => {
+            const manifest = manifests.find(candidate => candidate.entry === packageDir);
+
+            //filter lock.packages."".dependecies for bzl dependencies
+            DEPENDENCY_FIELDS.forEach(field => {
+                Object.keys(lock.packages[packageDir][field] || {})
+                    .filter(dependencyName => {
+                        const dependencyDir = resolveEntry(lock.packages, packageDir, dependencyName);
+
+                        return !!dependencyDir && deletedDirs.has(dependencyDir);
+                    })
+                    .forEach(beezeelinxDependencyName => {
+                        delete lock.packages[packageDir][field][beezeelinxDependencyName]; // clean package-lock."".dependencies
+
+                        if (manifest) {
+                            removeReference(manifest.json, beezeelinxDependencyName);
+                        }
+                    });
+            });
+        });
+
+        deletedDirs.forEach(packageDir => delete lock.packages[packageDir]); // clean package-lock.json: example: lock.packages."node_module/bzl-cms..."
+
+        beezeelinxReposDirs.forEach(beezeelinxRepo => removed.add(beezeelinxRepo.slice(beezeelinxRepo.lastIndexOf('node_modules/') + 'node_modules/'.length)));
+    }
+
+    if (lock && lock.dependencies) {
+
+        // lockfileVersion 2 keeps a legacy tree beside `packages`, where a git dependency carries
+        // its URL as version. npm installs from `packages`, so this tree is never the one that
+        // matters: prune it only so no first party URL survives in the file
+
+        /**
+         * @param {Record<string, any>} dependencies
+         */
+        const pruneLegacy = (dependencies) => {
+            Object.keys(dependencies).forEach(name => {
+                const info = dependencies[name];
+
+                if (isFirstParty(name) || isFirstParty(info.resolved) || isFirstParty(info.version)) {
+                    delete dependencies[name];
+                    removed.add(name);
+
+                    return;
+                }
+
+                if (info.dependencies) {
+                    pruneLegacy(info.dependencies);
+                }
+            });
+        };
+
+        pruneLegacy(lock.dependencies);
+    }
+
+    // clean the package.json
+    manifests.forEach(manifest => {
+        const entry = lock && lock.packages ? lock.packages[manifest.entry] : undefined;
+
+        DEPENDENCY_FIELDS.forEach(field => {
+            Object.entries(manifest.json[field] || {})
+                .filter(([name, spec]) => isFirstParty(name) || isFirstParty(/** @type string */(spec)))
+                .forEach(([name]) => {
+                    delete manifest.json[field][name];
+                    removeReference(entry, name);
+                    removed.add(name);
+                });
+        });
+    });
+
+    if (removed.size === 0) {
+        return [];
+    }
+
+    for (const manifest of manifests) {
+        await Fs.writeJson(manifest.path, manifest.json, { spaces: 2 });
+    }
+
+    if (lock) {
+        await Fs.writeJson(lockPath, lock, { spaces: 2 });
+    }
+
+    return [...removed].sort();
+}
+
+/**
  *
  *
  * @param {string} modulePath
@@ -374,9 +610,24 @@ async function getLicensesInfo(modulePath) {
                 if (src.indexOf('node_modules') !== -1 || src.indexOf('.tmp') !== -1 || src.indexOf('.git') !== -1) {
                     return false;
                 }
+
+                // The copy only exists to install the dependencies of the module: leave behind
+                // whatever cannot be read rather than failing the whole check on it.
+
+                if (!isReadable(src)) {
+                    console.error(clc.yellow(`Skipping "${Path.relative(modulePath, src)}": permission denied`));
+                    return false;
+                }
+
                 return true;
             }
         });
+
+        const removed = await removeFirstPartyDependencies(o.path);
+
+        if (removed.length > 0) {
+            Console.log(clc.italic(`Skipping ${removed.length} first party dependencies: ${removed.join(', ')}`));
+        }
 
         Console.log(clc.italic(`Installing package dependencies...`));
 
@@ -404,33 +655,38 @@ async function getLicensesInfo(modulePath) {
         });
 
         // Keep only the direct dependencies: as the packages list is flatten, indirect dependencies are visible in node_modules
-        // Remove BeeZeeLinx packages and packages from github
+        // Remove first party packages and packages from github
 
-        const directDependencies = Object.keys(packageJson['dependencies']) || [];
+        const directDependencies = new Map(Object.entries(packageJson['dependencies'] || {}));
 
         Object.keys(packages).forEach(packageNameVersion => {
-            const packageInfo = packages[packageNameVersion];
+            const packageInfo = /** @type {PackageLicenseInfo} */ (packages[packageNameVersion]);
+            const packageName = packageInfo.name || '';
 
-            if ((packageInfo.repository || '').includes('beezeelinx') || directDependencies.indexOf(packageInfo.name) === -1) {
+            if (!directDependencies.has(packageName)) {
                 delete packages[packageNameVersion];
                 return;
             }
 
-            if (Object.entries(packageJson['dependencies']).filter(([name, version]) => name === packageInfo.name && version.match(/^github:/)).length !== 0) {
+            const spec = /** @type string */ (directDependencies.get(packageName));
+            if (isFirstParty(packageName) || isFirstParty(packageInfo.repository) || isFirstParty(spec) || GITHUB_SHORTHAND.test(spec)) {
                 delete packages[packageNameVersion];
                 return;
             }
 
-            // Test if the package is white listed and get its license
+            // Test if the package is white listed for the license it has been reported with: an
+            // exception is granted for a given package *and* a given license, so a package that
+            // gets relicensed loses it
 
             const whiteListedLicense = licenseTypes.getWhiteListedLicense(packageInfo.name, /** @type string */(packageInfo.licenses));
 
             if (whiteListedLicense) {
                 packageInfo.licenses = whiteListedLicense;
+                packageInfo.whiteListed = true;
             }
         });
 
-        return { licensesInfo: packages };
+        return { licensesInfo: /** @type { Record<string, PackageLicenseInfo> } */ (packages) };
     }, { unsafeCleanup: true });
 
     return { packageInfo: packageJson, licenses: licensesInfo };
