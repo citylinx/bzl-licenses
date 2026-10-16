@@ -15,6 +15,8 @@
 
 const Yargs = require('yargs/yargs');
 const { hideBin } = require('yargs/helpers');
+const clc = require('cli-color');
+const licenseTypes = require('./lib/licenses_types');
 
 Yargs(hideBin(process.argv))
     .strict()
@@ -45,6 +47,9 @@ Yargs(hideBin(process.argv))
     .check((argv, _options) => {
         if (argv.nocolor) {
             process.env['NO_COLOR'] = 'true';
+        }
+        if (licenseTypes.isLicenseCheckSkipped()) {
+            console.error(clc.yellow('BZL_SKIP_LICENSE_WHITELIST_CHECK is set: the licenses are not checked, only the release date of the packages'));
         }
         return true;
     })
