@@ -159,6 +159,10 @@
             DOCKER_ARGS="$DOCKER_ARGS -e GITURL=$GITURL"
         fi
 
+        if [ "$BZL_SKIP_LICENSE_WHITELIST_CHECK" != "" ]; then
+            DOCKER_ARGS="$DOCKER_ARGS -e BZL_SKIP_LICENSE_WHITELIST_CHECK=$BZL_SKIP_LICENSE_WHITELIST_CHECK"
+        fi
+
         echo
         echo "Checking licenses of $REPO_PATH"
         echo

@@ -164,9 +164,10 @@ async function saveGo3rdPartyLicenses(argv) {
         Console.log('Main module:', clc.green(main.Path));
         Console.log(`Create 3rd party licenses file ${clc.cyan(csvPath)}`);
 
+        const skipLicenseCheck = licenseTypes.isLicenseCheckSkipped();
         let hasLicenseError = false;
         const data = await Promise.all(licenses.map(async licenseInfo => {
-            const licenseError = licenseInfo.license.error;
+            const licenseError = getLicenseError(licenseInfo.license, skipLicenseCheck);
             const licenseName = licenseInfo.license.matches && licenseInfo.license.matches[0] ? licenseInfo.license.matches[0].license : '';
 
             // Test license
@@ -174,7 +175,7 @@ async function saveGo3rdPartyLicenses(argv) {
             if (licenseError) {
                 console.error(`Error retrieving license of package ${licenseInfo.name}: ${licenseError}`);
                 hasLicenseError = true;
-            } else if (!licenseTypes.isValidLicense(licenseName) && !licenseInfo.license?.whiteListed) {
+            } else if (!skipLicenseCheck && !licenseTypes.isValidLicense(licenseName) && !licenseInfo.license?.whiteListed) {
                 console.error(`Invalid license ${licenseName} for the package ${licenseInfo.name}`);
                 hasLicenseError = true;
             }
@@ -252,20 +253,22 @@ async function listGo3rdPartyLicenses(argv) {
         Console.log('Main module:', clc.green(main.Path));
         Console.log('');
 
+        const skipLicenseCheck = licenseTypes.isLicenseCheckSkipped();
         const data = await Promise.all(licenses.map(async licenseInfo => {
-            let licenseError = licenseInfo.license.error;
+            let licenseError = getLicenseError(licenseInfo.license, skipLicenseCheck);
             const licenseName = licenseInfo.license.matches && licenseInfo.license.matches[0] ? licenseInfo.license.matches[0].license : '';
 
-            // Test license
+            // Test license. When the licenses check is skipped, the white list is ignored and a
+            // module is valid as soon as it is old enough
 
             let validity = -1;
             let date = '';
 
-            if (!licenseName) {
+            if (licenseInfo.license.unavailable || (!skipLicenseCheck && !licenseName)) {
                 licenseError = licenseError || 'Missing license information';
             } else {
-                const isValid = licenseTypes.isValidLicense(licenseName);
-                const isWhiteListed = !!licenseInfo.license?.whiteListed;
+                const isValid = skipLicenseCheck || licenseTypes.isValidLicense(licenseName);
+                const isWhiteListed = !skipLicenseCheck && !!licenseInfo.license?.whiteListed;
                 const olderThan1Week = await isOlderThan1Week(licenseInfo);
                 if ((isValid || isWhiteListed) && olderThan1Week.valid) {
                     validity = 0;
@@ -293,7 +296,7 @@ async function listGo3rdPartyLicenses(argv) {
 
         if (argv.check) {
             await Promise.all(licenses.map(async licenseInfo => {
-                const licenseError = licenseInfo.license.error;
+                const licenseError = getLicenseError(licenseInfo.license, skipLicenseCheck);
                 const licenseName = licenseInfo.license.matches && licenseInfo.license.matches[0] ? licenseInfo.license.matches[0].license : '';
 
                 // Test license
@@ -301,7 +304,7 @@ async function listGo3rdPartyLicenses(argv) {
                 if (licenseError) {
                     console.error(`Error retrieving license of package ${licenseInfo.name}: ${licenseError}`);
                     hasLicenseError = true;
-                } else if (!licenseTypes.isValidLicense(licenseName) && !licenseInfo.license?.whiteListed) {
+                } else if (!skipLicenseCheck && !licenseTypes.isValidLicense(licenseName) && !licenseInfo.license?.whiteListed) {
                     console.error(`Invalid license ${licenseName} for the package ${licenseInfo.name}`);
                     hasLicenseError = true;
                 }
@@ -607,6 +610,19 @@ async function getModuleDependencies(modulePath, rootPath = modulePath, visited 
     // Remove BeeZeeLinx and CityLinx packages
 
     return _.sortBy(moduleDeps.filter(moduleDep => moduleDep.Main || !isFirstParty(moduleDep.Path)), 'Path');
+}
+
+/**
+ * Error of the license information of a module. When the licenses check is skipped the license
+ * errors are left out, except for a module that could not be downloaded: its release date cannot be
+ * checked either
+ *
+ * @param {LicenseInfo} license
+ * @param {boolean} skipLicenseCheck
+ * @return {string | undefined}
+ */
+function getLicenseError(license, skipLicenseCheck) {
+    return (skipLicenseCheck && !license.unavailable) ? undefined : license.error;
 }
 
 /**

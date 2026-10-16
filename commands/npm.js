@@ -152,6 +152,7 @@ async function saveNpm3rdPartyLicenses(argv) {
         Console.log('Main module:', clc.green(packageInfo.name));
         Console.log(`Create 3rd party licenses file ${clc.cyan(csvPath)}`);
 
+        const skipLicenseCheck = licenseTypes.isLicenseCheckSkipped();
         let hasLicenseError = false;
         const data = await Promise.all(Object.keys(licenses).map(async key => {
             const licenseInfo = licenses[key];
@@ -161,11 +162,11 @@ async function saveNpm3rdPartyLicenses(argv) {
 
             // Test license
 
-            if (!licenseName) {
+            if (!skipLicenseCheck && !licenseName) {
                 licenseError = 'Missing license information';
                 console.error(clc.red(`Package ${licenseInfo.name} is missing a license information`));
                 hasLicenseError = true;
-            } else if (!licenseTypes.isValidLicense(licenseName) && !licenseInfo.whiteListed) {
+            } else if (!skipLicenseCheck && !licenseTypes.isValidLicense(licenseName) && !licenseInfo.whiteListed) {
                 licenseError = 'Invalid/unknown license';
                 console.error(clc.red(`Invalid license ${licenseName} for the package ${licenseInfo.name}`));
                 hasLicenseError = true;
@@ -239,21 +240,23 @@ async function listNpm3rdPartyLicenses(argv) {
         Console.log('Main package:', clc.green(packageInfo.name));
         Console.log('');
 
+        const skipLicenseCheck = licenseTypes.isLicenseCheckSkipped();
         const data = await Promise.all(Object.keys(licenses).map(async key => {
             const licenseInfo = licenses[key];
             const licenseName = licenseInfo.licenses;
             let licenseError = '';
 
-            // Test license
+            // Test license. When the licenses check is skipped, the white list is ignored and a
+            // package is valid as soon as it is old enough
 
             let validity = -1;
             let date = '';
 
-            if (!licenseName) {
+            if (!skipLicenseCheck && !licenseName) {
                 licenseError = 'Missing license information';
             } else {
-                const isValid = licenseTypes.isValidLicense(licenseName);
-                const isWhiteListed = !!licenseInfo.whiteListed;
+                const isValid = skipLicenseCheck || licenseTypes.isValidLicense(licenseName);
+                const isWhiteListed = !skipLicenseCheck && !!licenseInfo.whiteListed;
                 const info = await isOlderThan1Week(licenseInfo);
                 if ((isValid || isWhiteListed) && info.valid) {
                     validity = 0;
@@ -286,10 +289,10 @@ async function listNpm3rdPartyLicenses(argv) {
 
                 // Test license
 
-                if (!licenseName) {
+                if (!skipLicenseCheck && !licenseName) {
                     console.error(clc.red(`Package ${licenseInfo.name} is missing a license information`));
                     hasLicenseError = true;
-                } else if (!licenseTypes.isValidLicense(licenseName) && !licenseInfo.whiteListed) {
+                } else if (!skipLicenseCheck && !licenseTypes.isValidLicense(licenseName) && !licenseInfo.whiteListed) {
                     console.error(clc.red(`Invalid license ${licenseName} for the package ${licenseInfo.name}`));
                     hasLicenseError = true;
                 }
